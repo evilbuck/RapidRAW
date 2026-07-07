@@ -83,6 +83,7 @@ fn compute_thumbnail_cache_hash(path_str: &str, adjustments_bytes: &[u8]) -> Opt
 
 struct ImageFileMetadata {
     is_edited: bool,
+    is_negative: bool,
     tags: Option<Vec<String>>,
     rating: u8,
     is_raw: bool,
@@ -107,8 +108,10 @@ fn resolve_image_metadata(
     let tm_override = crate::image_processing::resolve_tonemapper_override(settings, is_raw);
     let is_edited =
         crate::image_processing::is_image_edited(&metadata.adjustments, is_raw, tm_override);
+    let is_negative = adjustments_is_negative(&metadata.adjustments);
     ImageFileMetadata {
         is_edited,
+        is_negative,
         tags: metadata.tags,
         rating: metadata.rating,
         is_raw,
@@ -283,6 +286,7 @@ pub struct ImageFile {
     pub path: String,
     modified: u64,
     is_edited: bool,
+    is_negative: bool,
     rating: u8,
     tags: Option<Vec<String>>,
     exif: Option<HashMap<String, String>>,
@@ -373,6 +377,16 @@ fn assign_group_ids(files: &mut [ImageFile], settings: &crate::app_settings::App
             files[candidate.index].group_id = Some(key.clone());
         }
     }
+}
+
+/// True when the sidecar has an enabled in-library negative conversion — lets the
+/// library/filmstrip context menu offer "Revert to Negative" instead of "Convert".
+pub(crate) fn adjustments_is_negative(adjustments: &serde_json::Value) -> bool {
+    adjustments
+        .get("negativeConversion")
+        .and_then(|nc| nc.get("enabled"))
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -655,6 +669,7 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
                     );
                     ImageFileMetadata {
                         is_edited: false,
+                        is_negative: false,
                         tags: None,
                         rating: 0,
                         is_raw: crate::formats::is_raw_file(&path_buf),
@@ -667,6 +682,7 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
                     path: virtual_path,
                     modified,
                     is_edited: metadata.is_edited,
+                    is_negative: metadata.is_negative,
                     tags: metadata.tags,
                     exif: None,
                     is_virtual_copy,
@@ -788,6 +804,7 @@ pub fn list_images_recursive(
                     );
                     ImageFileMetadata {
                         is_edited: false,
+                        is_negative: false,
                         tags: None,
                         rating: 0,
                         is_raw: crate::formats::is_raw_file(&path_buf),
@@ -800,6 +817,7 @@ pub fn list_images_recursive(
                     path: virtual_path,
                     modified,
                     is_edited: metadata.is_edited,
+                    is_negative: metadata.is_negative,
                     tags: metadata.tags,
                     exif: None,
                     is_virtual_copy,
@@ -1059,6 +1077,7 @@ pub fn get_album_images(
                 );
                 ImageFileMetadata {
                     is_edited: false,
+                    is_negative: false,
                     tags: None,
                     rating: 0,
                     is_raw: crate::formats::is_raw_file(&source_path),
@@ -1071,6 +1090,7 @@ pub fn get_album_images(
                 path: virtual_path.clone(),
                 modified,
                 is_edited: metadata.is_edited,
+                is_negative: metadata.is_negative,
                 tags: metadata.tags,
                 exif: None,
                 is_virtual_copy,
@@ -2034,6 +2054,61 @@ fn emit_thumbnail_generated(
     );
 }
 
+/// Regenerate grid/filmstrip thumbnails for the given paths and push each to the
+/// frontend via `thumbnail-generated`. Used by commands that change the decoded
+/// base out-of-band (e.g. negative conversion), where the sidecar edit alone
+/// wouldn't prompt the grid to refresh.
+pub fn regenerate_thumbnails_for_paths(paths: &[String], app_handle: &AppHandle) {
+    let state = app_handle.state::<AppState>();
+
+    // Evict any pre-change cached base so the new one is decoded.
+    if let Ok(mut cache) = state.thumbnail_geometry_cache.lock() {
+        for p in paths {
+            cache.remove(p);
+        }
+    }
+
+    let settings = load_settings(app_handle.clone()).unwrap_or_default();
+    add_to_thumbnail_queue(&state, paths.len(), app_handle);
+
+    let thumb_cache_dir = match resolve_thumbnail_cache_dir(app_handle) {
+        Ok(dir) => dir,
+        Err(e) => {
+            log::warn!("Unable to initialize thumbnail cache directory: {}", e);
+            for path in paths {
+                emit_thumbnail_cache_setup_error(app_handle, path, &e);
+            }
+            for _ in 0..paths.len() {
+                increment_thumbnail_progress(&state, app_handle);
+            }
+            return;
+        }
+    };
+
+    let gpu_context = crate::gpu_processing::get_or_init_gpu_context(&state, app_handle).ok();
+
+    paths.par_iter().for_each(|path_str| {
+        let result = generate_single_thumbnail_and_cache(
+            path_str,
+            &thumb_cache_dir,
+            gpu_context.as_ref(),
+            None,
+            true,
+            app_handle,
+            &settings,
+        );
+
+        if let Some((thumbnail_data, rating, is_edited)) = result {
+            let _ = app_handle.emit(
+                "thumbnail-generated",
+                serde_json::json!({ "path": path_str, "data": thumbnail_data, "rating": rating, "is_edited": is_edited }),
+            );
+        }
+
+        increment_thumbnail_progress(&state, app_handle);
+    });
+}
+
 pub fn resolve_lens_params_in_adjustments(
     adjustments: &mut Value,
     exif_data: &Option<HashMap<String, String>>,
@@ -2504,7 +2579,22 @@ pub fn save_metadata_and_update_thumbnail(
         );
     }
 
+    // `negativeConversion` is owned by the negative-conversion command (it carries
+    // backend-computed bounds). A normal adjustments save must never strip or
+    // overwrite it, so restore the sidecar's own value regardless of what the frontend
+    // sent — otherwise navigating away from a converted negative silently un-converts it.
+    let preserved_negative = metadata.adjustments.get("negativeConversion").cloned();
     metadata.adjustments = final_adjustments;
+    if let Some(obj) = metadata.adjustments.as_object_mut() {
+        match preserved_negative {
+            Some(nc) => {
+                obj.insert("negativeConversion".to_string(), nc);
+            }
+            None => {
+                obj.remove("negativeConversion");
+            }
+        }
+    }
 
     let json_string = serde_json::to_string_pretty(&metadata).map_err(|e| e.to_string())?;
     std::fs::write(&sidecar_path, json_string).map_err(|e| e.to_string())?;
