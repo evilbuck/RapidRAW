@@ -379,8 +379,7 @@ fn assign_group_ids(files: &mut [ImageFile], settings: &crate::app_settings::App
     }
 }
 
-/// True when the sidecar has an enabled in-library negative conversion — lets the
-/// library/filmstrip context menu offer "Revert to Negative" instead of "Convert".
+/// True when the sidecar has an enabled in-library negative conversion.
 pub(crate) fn adjustments_is_negative(adjustments: &serde_json::Value) -> bool {
     adjustments
         .get("negativeConversion")
@@ -2055,9 +2054,7 @@ fn emit_thumbnail_generated(
 }
 
 /// Regenerate grid/filmstrip thumbnails for the given paths and push each to the
-/// frontend via `thumbnail-generated`. Used by commands that change the decoded
-/// base out-of-band (e.g. negative conversion), where the sidecar edit alone
-/// wouldn't prompt the grid to refresh.
+/// frontend via `thumbnail-generated`.
 pub fn regenerate_thumbnails_for_paths(paths: &[String], app_handle: &AppHandle) {
     let state = app_handle.state::<AppState>();
 
@@ -2579,10 +2576,8 @@ pub fn save_metadata_and_update_thumbnail(
         );
     }
 
-    // `negativeConversion` is owned by the negative-conversion command (it carries
-    // backend-computed bounds). A normal adjustments save must never strip or
-    // overwrite it, so restore the sidecar's own value regardless of what the frontend
-    // sent — otherwise navigating away from a converted negative silently un-converts it.
+    // `negativeConversion` is owned by set_negative_conversion; a normal save must
+    // preserve the sidecar's own value rather than the frontend's.
     let preserved_negative = metadata.adjustments.get("negativeConversion").cloned();
     metadata.adjustments = final_adjustments;
     if let Some(obj) = metadata.adjustments.as_object_mut() {
